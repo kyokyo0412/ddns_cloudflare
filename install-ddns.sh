@@ -26,6 +26,16 @@ RECORD_NAME="${RECORD_NAME:-}"
 RECORD_TYPE="${RECORD_TYPE:-A}"
 INTERVAL="${INTERVAL:-5}"
 
+# 若已有配置文件且未提供环境变量，则沿用旧配置（方便直接重跑修复）
+if [[ -f "$CONF_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$CONF_FILE"
+  CF_API_TOKEN="${CF_API_TOKEN:-$CF_API_TOKEN}"
+  ZONE_ID="${ZONE_ID:-$ZONE_ID}"
+  RECORD_NAME="${RECORD_NAME:-$RECORD_NAME}"
+  RECORD_TYPE="${RECORD_TYPE:-$RECORD_TYPE}"
+fi
+
 if [[ -z "$CF_API_TOKEN" ]]; then
   read -rsp "请输入 Cloudflare API Token: " CF_API_TOKEN; echo
 fi
@@ -66,7 +76,11 @@ mkdir -p "$INSTALL_DIR"
 
 cat > "$INSTALL_DIR/ddns.py" <<'PYEOF'
 #!/usr/bin/env python3
-"""Cloudflare DDNS：仅在公网 IP 变化时更新 A/AAAA 记录；记录不存在则自动创建。"""
+"""
+Cloudflare DDNS：仅在公网 IP 变化时更新 A/AAAA 记录；记录不存在则自动创建。
+对同名同类型记录做去重清理：只保留一条指向当前公网 IP 的记录，
+删除所有过期/重复记录，避免 DNS 查询返回旧 IP。
+"""
 import json
 import sys
 import ipaddress
@@ -141,6 +155,7 @@ def main():
     query = urllib.parse.urlencode({"type": rtype, "name": name})
     records = api("GET", f"/zones/{zone}/dns_records?{query}", token)["result"]
 
+    # 没有任何记录：直接创建
     if not records:
         api("POST", f"/zones/{zone}/dns_records", token, {
             "type": rtype, "name": name, "content": ip,
@@ -149,13 +164,29 @@ def main():
         print(f"已创建 {rtype} 记录 {name} -> {ip}")
         return
 
-    rec = records[0]
-    if rec["content"] == ip:
-        print(f"IP 未变化 ({ip})，跳过。")
-        return
+    # 分类：已经指向正确 IP 的 vs 过期/错误的
+    correct_records = [r for r in records if r["content"] == ip]
+    stale_records = [r for r in records if r["content"] != ip]
 
-    api("PATCH", f"/zones/{zone}/dns_records/{rec['id']}", token, {"content": ip})
-    print(f"已更新 {name}: {rec['content']} -> {ip}")
+    if correct_records:
+        # 已有正确记录：保留第一条正确的，删除其余所有（包括重复的正确记录和过期记录）
+        keep = correct_records[0]
+        to_delete = correct_records[1:] + stale_records
+        if not to_delete:
+            print(f"IP 未变化 ({ip})，仅有一条正确记录，无需操作。")
+            return
+        for r in to_delete:
+            api("DELETE", f"/zones/{zone}/dns_records/{r['id']}", token)
+            print(f"已删除多余/过期记录: {r['content']} (id={r['id']})")
+        print(f"IP 未变化 ({ip})，保留记录 id={keep['id']}，清理了 {len(to_delete)} 条多余记录。")
+    else:
+        # 没有正确记录：选第一条更新为当前 IP，删除其余所有
+        target = stale_records[0]
+        api("PATCH", f"/zones/{zone}/dns_records/{target['id']}", token, {"content": ip})
+        print(f"已更新记录 id={target['id']}: {target['content']} -> {ip}")
+        for r in stale_records[1:]:
+            api("DELETE", f"/zones/{zone}/dns_records/{r['id']}", token)
+            print(f"已删除过期记录: {r['content']} (id={r['id']})")
 
 if __name__ == "__main__":
     try:
@@ -205,11 +236,11 @@ EOF
 systemctl daemon-reload
 systemctl enable --now cf-ddns.timer >/dev/null 2>&1
 
-# ============ 立即执行一次验证 ============
-echo "→ 立即执行一次更新测试 ..."
+# ============ 立即执行一次验证（清理 + 更新） ============
+echo "→ 立即执行一次更新/清理测试 ..."
 systemctl start cf-ddns.service || true
 sleep 2
-journalctl -u cf-ddns.service -n 10 --no-pager -o cat || true
+journalctl -u cf-ddns.service -n 20 --no-pager -o cat || true
 
 echo
 echo "✅ 安装完成"
